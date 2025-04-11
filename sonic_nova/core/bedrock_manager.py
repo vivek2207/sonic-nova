@@ -1,150 +1,66 @@
+"""AWS Bedrock Stream Manager for Nova Sonic model."""
+
 import os
-import asyncio
-import base64
 import json
 import uuid
-import warnings
-import pyaudio
-import pytz
-import random
-import hashlib
+import base64
+import asyncio
 import datetime
-import time
-import inspect
-from dotenv import load_dotenv
+import hashlib
+import random
+import pytz
 from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient, InvokeModelWithBidirectionalStreamOperationInput
 from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart
 from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4AuthScheme
 from smithy_aws_core.credentials_resolvers.environment import EnvironmentCredentialsResolver
 
-# Import from our new modules
-from sonic_nova.config.audio_config import (
-    INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, CHANNELS, FORMAT, CHUNK_SIZE
+from sonic_nova.utils.helpers import debug_print, time_it_async
+from sonic_nova.models.events import (
+    START_SESSION_EVENT,
+    SESSION_END_EVENT,
+    CONTENT_START_EVENT,
+    CONTENT_END_EVENT,
+    AUDIO_EVENT_TEMPLATE,
+    TEXT_CONTENT_START_EVENT,
+    TEXT_INPUT_EVENT,
+    TOOL_CONTENT_START_EVENT,
+    PROMPT_END_EVENT,
 )
-from sonic_nova.utils.helpers import debug_print, time_it, time_it_async, DEBUG
-from sonic_nova.core.bedrock_manager import BedrockStreamManager
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Suppress warnings
-warnings.filterwarnings("ignore")
-
-# Debug mode flag is now imported from helpers
 
 class BedrockStreamManager:
     """Manages bidirectional streaming with AWS Bedrock using asyncio"""
     
-    # Event templates
-    START_SESSION_EVENT = '''{
-        "event": {
-            "sessionStart": {
-            "inferenceConfiguration": {
-                "maxTokens": 1024,
-                "topP": 0.9,
-                "temperature": 0.7
-                }
-            }
-        }
-    }'''
+    def __init__(self, model_id='ermis', region='us-east-1'):
+        """Initialize the stream manager."""
+        self.model_id = model_id
+        self.region = region
+        
+        # Replace RxPy subjects with asyncio queues
+        self.audio_input_queue = asyncio.Queue()
+        self.audio_output_queue = asyncio.Queue()
+        self.output_queue = asyncio.Queue()
+        
+        self.response_task = None
+        self.stream_response = None
+        self.is_active = False
+        self.barge_in = False
+        self.bedrock_client = None
+        
+        # Audio playback components
+        self.audio_player = None
+        
+        # Text response components
+        self.display_assistant_text = False
+        self.role = None
 
-    CONTENT_START_EVENT = '''{
-        "event": {
-            "contentStart": {
-            "promptName": "%s",
-            "contentName": "%s",
-            "type": "AUDIO",
-            "interactive": true,
-            "role": "USER",
-            "audioInputConfiguration": {
-                "mediaType": "audio/lpcm",
-                "sampleRateHertz": 16000,
-                "sampleSizeBits": 16,
-                "channelCount": 1,
-                "audioType": "SPEECH",
-                "encoding": "base64"
-                }
-            }
-        }
-    }'''
+        # Session information
+        self.prompt_name = str(uuid.uuid4())
+        self.content_name = str(uuid.uuid4())
+        self.audio_content_name = str(uuid.uuid4())
+        self.toolUseContent = ""
+        self.toolUseId = ""
+        self.toolName = ""
 
-    AUDIO_EVENT_TEMPLATE = '''{
-        "event": {
-            "audioInput": {
-            "promptName": "%s",
-            "contentName": "%s",
-            "content": "%s"
-            }
-        }
-    }'''
-
-    TEXT_CONTENT_START_EVENT = '''{
-        "event": {
-            "contentStart": {
-            "promptName": "%s",
-            "contentName": "%s",
-            "type": "TEXT",
-            "role": "%s",
-            "interactive": true,
-                "textInputConfiguration": {
-                    "mediaType": "text/plain"
-                }
-            }
-        }
-    }'''
-
-    TEXT_INPUT_EVENT = '''{
-        "event": {
-            "textInput": {
-            "promptName": "%s",
-            "contentName": "%s",
-            "content": "%s"
-            }
-        }
-    }'''
-
-    TOOL_CONTENT_START_EVENT = '''{
-        "event": {
-            "contentStart": {
-                "promptName": "%s",
-                "contentName": "%s",
-                "interactive": false,
-                "type": "TOOL",
-                "role": "TOOL",
-                "toolResultInputConfiguration": {
-                    "toolUseId": "%s",
-                    "type": "TEXT",
-                    "textInputConfiguration": {
-                        "mediaType": "text/plain"
-                    }
-                }
-            }
-        }
-    }'''
-
-    CONTENT_END_EVENT = '''{
-        "event": {
-            "contentEnd": {
-            "promptName": "%s",
-            "contentName": "%s"
-            }
-        }
-    }'''
-
-    PROMPT_END_EVENT = '''{
-        "event": {
-            "promptEnd": {
-            "promptName": "%s"
-            }
-        }
-    }'''
-
-    SESSION_END_EVENT = '''{
-        "event": {
-            "sessionEnd": {}
-        }
-    }'''
-    
     def start_prompt(self):
         """Create a promptStart event"""
         get_default_tool_schema = json.dumps({
@@ -169,7 +85,6 @@ class BedrockStreamManager:
             "required": ["orderId"]
         })
 
-        
         prompt_start_event = {
             "event": {
                 "promptStart": {
@@ -219,7 +134,6 @@ class BedrockStreamManager:
     
     def tool_result_event(self, content_name, content, role):
         """Create a tool result event"""
-
         if isinstance(content, dict):
             content_json_string = json.dumps(content)
         else:
@@ -235,37 +149,6 @@ class BedrockStreamManager:
             }
         }
         return json.dumps(tool_result_event)
-   
-    def __init__(self, model_id='ermis', region='us-east-1'):
-        """Initialize the stream manager."""
-        self.model_id = model_id
-        self.region = region
-        
-        # Replace RxPy subjects with asyncio queues
-        self.audio_input_queue = asyncio.Queue()
-        self.audio_output_queue = asyncio.Queue()
-        self.output_queue = asyncio.Queue()
-        
-        self.response_task = None
-        self.stream_response = None
-        self.is_active = False
-        self.barge_in = False
-        self.bedrock_client = None
-        
-        # Audio playback components
-        self.audio_player = None
-        
-        # Text response components
-        self.display_assistant_text = False
-        self.role = None
-
-        # Session information
-        self.prompt_name = str(uuid.uuid4())
-        self.content_name = str(uuid.uuid4())
-        self.audio_content_name = str(uuid.uuid4())
-        self.toolUseContent = ""
-        self.toolUseId = ""
-        self.toolName = ""
 
     def _initialize_client(self):
         """Initialize the Bedrock client."""
@@ -291,11 +174,11 @@ class BedrockStreamManager:
             
             # Send initialization events
             prompt_event = self.start_prompt()
-            text_content_start = self.TEXT_CONTENT_START_EVENT % (self.prompt_name, self.content_name, "SYSTEM")
-            text_content = self.TEXT_INPUT_EVENT % (self.prompt_name, self.content_name, default_system_prompt)
-            text_content_end = self.CONTENT_END_EVENT % (self.prompt_name, self.content_name)
+            text_content_start = TEXT_CONTENT_START_EVENT % (self.prompt_name, self.content_name, "SYSTEM")
+            text_content = TEXT_INPUT_EVENT % (self.prompt_name, self.content_name, default_system_prompt)
+            text_content_end = CONTENT_END_EVENT % (self.prompt_name, self.content_name)
             
-            init_events = [self.START_SESSION_EVENT, prompt_event, text_content_start, text_content, text_content_end]
+            init_events = [START_SESSION_EVENT, prompt_event, text_content_start, text_content, text_content_end]
             
             for event in init_events:
                 await self.send_raw_event(event)
@@ -345,7 +228,7 @@ class BedrockStreamManager:
     
     async def send_audio_content_start_event(self):
         """Send a content start event to the Bedrock stream."""
-        content_start_event = self.CONTENT_START_EVENT % (self.prompt_name, self.audio_content_name)
+        content_start_event = CONTENT_START_EVENT % (self.prompt_name, self.audio_content_name)
         await self.send_raw_event(content_start_event)
     
     async def _process_audio_input(self):
@@ -362,7 +245,7 @@ class BedrockStreamManager:
                 
                 # Base64 encode the audio data
                 blob = base64.b64encode(audio_bytes)
-                audio_event = self.AUDIO_EVENT_TEMPLATE % (
+                audio_event = AUDIO_EVENT_TEMPLATE % (
                     self.prompt_name, 
                     self.audio_content_name, 
                     blob.decode('utf-8')
@@ -393,13 +276,13 @@ class BedrockStreamManager:
             debug_print("Stream is not active")
             return
         
-        content_end_event = self.CONTENT_END_EVENT % (self.prompt_name, self.audio_content_name)
+        content_end_event = CONTENT_END_EVENT % (self.prompt_name, self.audio_content_name)
         await self.send_raw_event(content_end_event)
         debug_print("Audio ended")
     
     async def send_tool_start_event(self, content_name):
         """Send a tool content start event to the Bedrock stream."""
-        content_start_event = self.TOOL_CONTENT_START_EVENT % (self.prompt_name, content_name, self.toolUseId)
+        content_start_event = TOOL_CONTENT_START_EVENT % (self.prompt_name, content_name, self.toolUseId)
         debug_print(f"Sending tool start event: {content_start_event}")  
         await self.send_raw_event(content_start_event)
 
@@ -412,7 +295,7 @@ class BedrockStreamManager:
     
     async def send_tool_content_end_event(self, content_name):
         """Send a tool content end event to the Bedrock stream."""
-        tool_content_end_event = self.CONTENT_END_EVENT % (self.prompt_name, content_name)
+        tool_content_end_event = CONTENT_END_EVENT % (self.prompt_name, content_name)
         debug_print(f"Sending tool content event: {tool_content_end_event}")
         await self.send_raw_event(tool_content_end_event)
     
@@ -422,7 +305,7 @@ class BedrockStreamManager:
             debug_print("Stream is not active")
             return
         
-        prompt_end_event = self.PROMPT_END_EVENT % (self.prompt_name)
+        prompt_end_event = PROMPT_END_EVENT % (self.prompt_name)
         await self.send_raw_event(prompt_end_event)
         debug_print("Prompt ended")
         
@@ -432,7 +315,7 @@ class BedrockStreamManager:
             debug_print("Stream is not active")
             return
 
-        await self.send_raw_event(self.SESSION_END_EVENT)
+        await self.send_raw_event(SESSION_END_EVENT)
         self.is_active = False
         debug_print("Session ended")
     
@@ -542,7 +425,6 @@ class BedrockStreamManager:
             }
         
         elif tool == "trackordertool":
-
             # Extract order ID from toolUseContent
             content = toolUseContent.get("content", {})
             content_data = json.loads(content)
@@ -644,220 +526,4 @@ class BedrockStreamManager:
         await self.send_session_end_event()
 
         if self.stream_response:
-            await self.stream_response.input_stream.close()
-
-class AudioStreamer:
-    """Handles continuous microphone input and audio output using separate streams."""
-    
-    def __init__(self, stream_manager):
-        self.stream_manager = stream_manager
-        self.is_streaming = False
-        self.loop = asyncio.get_event_loop()
-
-        # Initialize PyAudio
-        debug_print("AudioStreamer Initializing PyAudio...")
-        self.p = time_it("AudioStreamerInitPyAudio", pyaudio.PyAudio)
-        debug_print("AudioStreamer PyAudio initialized")
-
-        # Initialize separate streams for input and output
-        # Input stream with callback for microphone
-        debug_print("Opening input audio stream...")
-        self.input_stream = time_it("AudioStreamerOpenAudio", lambda  : self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=INPUT_SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE,
-            stream_callback=self.input_callback
-        ))
-        debug_print("input audio stream opened")
-
-        # Output stream for direct writing (no callback)
-        debug_print("Opening output audio stream...")
-        self.output_stream = time_it("AudioStreamerOpenAudio", lambda  : self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=OUTPUT_SAMPLE_RATE,
-            output=True,
-            frames_per_buffer=CHUNK_SIZE
-        ))
-
-        debug_print("output audio stream opened")
-
-    def input_callback(self, in_data, frame_count, time_info, status):
-        """Callback function that schedules audio processing in the asyncio event loop"""
-        if self.is_streaming and in_data:
-            # Schedule the task in the event loop
-            asyncio.run_coroutine_threadsafe(
-                self.process_input_audio(in_data), 
-                self.loop
-            )
-        return (None, pyaudio.paContinue)
-
-    async def process_input_audio(self, audio_data):
-        """Process a single audio chunk directly"""
-        try:
-            # Send audio to Bedrock immediately
-            self.stream_manager.add_audio_chunk(audio_data)
-        except Exception as e:
-            if self.is_streaming:
-                print(f"Error processing input audio: {e}")
-    
-    async def play_output_audio(self):
-        """Play audio responses from Nova Sonic"""
-        while self.is_streaming:
-            try:
-                # Check for barge-in flag
-                if self.stream_manager.barge_in:
-                    # Clear the audio queue
-                    while not self.stream_manager.audio_output_queue.empty():
-                        try:
-                            self.stream_manager.audio_output_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                    self.stream_manager.barge_in = False
-                    # Small sleep after clearing
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # Get audio data from the stream manager's queue
-                audio_data = await asyncio.wait_for(
-                    self.stream_manager.audio_output_queue.get(),
-                    timeout=0.1
-                )
-                
-                if audio_data and self.is_streaming:
-                    # Write directly to the output stream in smaller chunks
-                    chunk_size = CHUNK_SIZE  # Use the same chunk size as the stream
-                    
-                    # Write the audio data in chunks to avoid blocking too long
-                    for i in range(0, len(audio_data), chunk_size):
-                        if not self.is_streaming:
-                            break
-                        
-                        end = min(i + chunk_size, len(audio_data))
-                        chunk = audio_data[i:end]
-                        
-                        # Create a new function that captures the chunk by value
-                        def write_chunk(data):
-                            return self.output_stream.write(data)
-                        
-                        # Pass the chunk to the function
-                        await asyncio.get_event_loop().run_in_executor(None, write_chunk, chunk)
-                        
-                        # Brief yield to allow other tasks to run
-                        await asyncio.sleep(0.001)
-                    
-            except asyncio.TimeoutError:
-                # No data available within timeout, just continue
-                continue
-            except Exception as e:
-                if self.is_streaming:
-                    print(f"Error playing output audio: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                await asyncio.sleep(0.05)
-    
-    async def start_streaming(self):
-        """Start streaming audio."""
-        if self.is_streaming:
-            return
-        
-        print("Starting audio streaming. Speak into your microphone...")
-        print("Press Enter to stop streaming...")
-        
-        # Send audio content start event
-        await time_it_async("send_audio_content_start_event", lambda : self.stream_manager.send_audio_content_start_event())
-        
-        self.is_streaming = True
-        
-        # Start the input stream if not already started
-        if not self.input_stream.is_active():
-            self.input_stream.start_stream()
-        
-        # Start processing tasks
-        #self.input_task = asyncio.create_task(self.process_input_audio())
-        self.output_task = asyncio.create_task(self.play_output_audio())
-        
-        # Wait for user to press Enter to stop
-        await asyncio.get_event_loop().run_in_executor(None, input)
-        
-        # Once input() returns, stop streaming
-        await self.stop_streaming()
-    
-    async def stop_streaming(self):
-        """Stop streaming audio."""
-        if not self.is_streaming:
-            return
-            
-        self.is_streaming = False
-
-        # Cancel the tasks
-        tasks = []
-        if hasattr(self, 'input_task') and not self.input_task.done():
-            tasks.append(self.input_task)
-        if hasattr(self, 'output_task') and not self.output_task.done():
-            tasks.append(self.output_task)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        # Stop and close the streams
-        if self.input_stream:
-            if self.input_stream.is_active():
-                self.input_stream.stop_stream()
-            self.input_stream.close()
-        if self.output_stream:
-            if self.output_stream.is_active():
-                self.output_stream.stop_stream()
-            self.output_stream.close()
-        if self.p:
-            self.p.terminate()
-        
-        await self.stream_manager.close() 
-
-
-async def main(debug=False):
-    """Main function to run the application."""
-    global DEBUG
-    DEBUG = debug
-
-    # Create stream manager
-    stream_manager = BedrockStreamManager(model_id='amazon.nova-sonic-v1:0', region='us-east-1')
-
-    # Create audio streamer
-    audio_streamer = AudioStreamer(stream_manager)
-
-    # Initialize the stream
-    await time_it_async("initialize_stream", stream_manager.initialize_stream)
-
-    try:
-        # This will run until the user presses Enter
-        await audio_streamer.start_streaming()
-        
-    except KeyboardInterrupt:
-        print("Interrupted by user")
-    finally:
-        # Clean up
-        await audio_streamer.stop_streaming()
-        
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Nova Sonic Python Streaming')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-    args = parser.parse_args()
-    # Set your AWS credentials here or use environment variables
-    # os.environ['AWS_ACCESS_KEY_ID'] = "AWS_ACCESS_KEY_ID"
-    # os.environ['AWS_SECRET_ACCESS_KEY'] = "AWS_SECRET_ACCESS_KEY"
-    # os.environ['AWS_DEFAULT_REGION'] = "us-east-1"
-
-    # Run the main function
-    try:
-        asyncio.run(main(debug=args.debug))
-    except Exception as e:
-        print(f"Application error: {e}")
-        if args.debug:
-            import traceback
-            traceback.print_exc()
+            await self.stream_response.input_stream.close() 
