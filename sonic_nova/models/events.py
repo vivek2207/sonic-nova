@@ -1,4 +1,24 @@
-"""Event templates for Nova Sonic model."""
+"""Event templates for the Sonic Nova application.
+
+This module contains all the event templates used for communication with the
+AWS Bedrock Nova model. The events follow a specific JSON format required by
+the Nova model's API.
+
+The module includes templates for:
+- Session management (start/end)
+- Content management (start/end)
+- Audio input/output
+- Text input/output
+- Tool usage
+
+Each template is a string that can be formatted with specific values using
+the Python string formatting operator %.
+
+Note:
+    All events must be valid JSON when formatted with appropriate values.
+    The events are designed to work with the Nova model's bidirectional
+    streaming API.
+"""
 
 # Session events
 START_SESSION_EVENT = '''{

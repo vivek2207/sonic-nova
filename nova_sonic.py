@@ -1,3 +1,25 @@
+"""Sonic Nova - Real-time Voice Interaction with AWS Bedrock Nova Model.
+
+This is the main entry point for the Sonic Nova application. It initializes the necessary
+components for real-time voice interaction with AWS Bedrock's Nova model, including:
+- Audio streaming (input from microphone and output to speakers)
+- Bedrock stream management (bidirectional communication with Nova model)
+- Debug mode configuration
+- Error handling and graceful shutdown
+
+The application supports the following features:
+- Natural language conversation
+- Order tracking queries
+- Date and time information
+- Real-time voice input and output
+
+Usage:
+    python nova_sonic.py [--debug]
+
+Options:
+    --debug    Enable debug mode for detailed logging
+"""
+
 import os
 import asyncio
 import warnings
@@ -19,7 +41,24 @@ load_dotenv()
 warnings.filterwarnings("ignore")
 
 async def main(debug=False):
-    """Main function to run the application."""
+    """Initialize and run the Sonic Nova application.
+    
+    This function sets up the core components of the application:
+    1. Configures debug mode
+    2. Creates and initializes the Bedrock stream manager
+    3. Creates and initializes the audio streamer
+    4. Starts the streaming process
+    5. Handles cleanup on shutdown
+    
+    Args:
+        debug (bool): Whether to enable debug mode. Defaults to False.
+    
+    Returns:
+        None
+    
+    Raises:
+        Exception: If there's an error during initialization or streaming.
+    """
     # Set debug mode
     set_debug(debug)
 
@@ -48,8 +87,14 @@ async def main(debug=False):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Nova Sonic Python Streaming')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser = argparse.ArgumentParser(
+        description='Sonic Nova - Real-time voice interaction with AWS Bedrock Nova model'
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug mode for detailed logging'
+    )
     args = parser.parse_args()
 
     # Run the main function
