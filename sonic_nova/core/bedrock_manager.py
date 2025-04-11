@@ -15,6 +15,7 @@ from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4
 from smithy_aws_core.credentials_resolvers.environment import EnvironmentCredentialsResolver
 
 from sonic_nova.utils.helpers import debug_print, time_it_async
+from sonic_nova.config.settings import is_debug
 from sonic_nova.models.events import (
     START_SESSION_EVENT,
     SESSION_END_EVENT,
@@ -167,7 +168,13 @@ class BedrockStreamManager:
             self._initialize_client()
         
         try:
-            self.stream_response = await time_it_async("invoke_model_with_bidirectional_stream", lambda : self.bedrock_client.invoke_model_with_bidirectional_stream( InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)))
+            @time_it_async("invoke_model_with_bidirectional_stream")
+            async def invoke_stream():
+                return await self.bedrock_client.invoke_model_with_bidirectional_stream(
+                    InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
+                )
+            
+            self.stream_response = await invoke_stream()
             self.is_active = True
             default_system_prompt = "You are a friend. The user and you will engage in a spoken dialog exchanging the transcripts of a natural real-time conversation." \
             "When reading order numbers, please read each digit individually, separated by pauses. For example, order #1234 should be read as 'order number one-two-three-four' rather than 'order number one thousand two hundred thirty-four'."
@@ -214,7 +221,7 @@ class BedrockStreamManager:
         try:
             await self.stream_response.input_stream.send(event)
             # For debugging large events, you might want to log just the type
-            if DEBUG:
+            if is_debug():
                 if len(event_json) > 200:
                     event_type = json.loads(event_json).get("event", {}).keys()
                     debug_print(f"Sent event type: {list(event_type)}")
@@ -222,7 +229,7 @@ class BedrockStreamManager:
                     debug_print(f"Sent event: {event_json}")
         except Exception as e:
             debug_print(f"Error sending event: {str(e)}")
-            if DEBUG:
+            if is_debug():
                 import traceback
                 traceback.print_exc()
     
@@ -258,7 +265,7 @@ class BedrockStreamManager:
                 break
             except Exception as e:
                 debug_print(f"Error processing audio: {e}")
-                if DEBUG:
+                if is_debug():
                     import traceback
                     traceback.print_exc()
     

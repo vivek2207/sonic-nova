@@ -1,28 +1,42 @@
-import time
-import datetime
-import inspect
+"""Utility functions for the Sonic Nova application."""
 
-# Debug mode flag
-DEBUG = False
+import time
+import asyncio
+import functools
+from sonic_nova.config.settings import is_debug
 
 def debug_print(message):
-    """Print only if debug mode is enabled"""
-    if DEBUG:
-        functionName = inspect.stack()[1].function
-        if functionName == 'time_it' or functionName == 'time_it_async':
-            functionName = inspect.stack()[2].function
-        print('{:%Y-%m-%d %H:%M:%S.%f}'.format(datetime.datetime.now())[:-3] + ' ' + functionName + ' ' + message)
+    """Print debug messages if debug mode is enabled."""
+    if is_debug():
+        print(f"[DEBUG] {message}")
 
-def time_it(label, methodToRun):
-    start_time = time.perf_counter()
-    result = methodToRun()
-    end_time = time.perf_counter()
-    debug_print(f"Execution time for {label}: {end_time - start_time:.4f} seconds")
-    return result
+def time_it(name, func=None):
+    """Decorator to measure and log the execution time of a function."""
+    if func is None:
+        return lambda f: time_it(name, f)
+    
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        debug_print(f"{name} took {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper
 
-async def time_it_async(label, methodToRun):
-    start_time = time.perf_counter()
-    result = await methodToRun()
-    end_time = time.perf_counter()
-    debug_print(f"Execution time for {label}: {end_time - start_time:.4f} seconds")
-    return result 
+def time_it_async(name, func=None):
+    """Decorator to measure and log the execution time of an async function."""
+    if func is None:
+        return lambda f: time_it_async(name, f)
+    
+    if not asyncio.iscoroutinefunction(func):
+        return func
+    
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = await func(*args, **kwargs)
+        end_time = time.time()
+        debug_print(f"{name} took {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper 

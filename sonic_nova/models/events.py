@@ -1,4 +1,4 @@
-"""Event templates for AWS Bedrock Nova Sonic model."""
+"""Event templates for Nova Sonic model."""
 
 # Session events
 START_SESSION_EVENT = '''{
